@@ -1,0 +1,437 @@
+#include "WebServerManager.h"
+#include <ArduinoJson.h>
+#include <LittleFS.h>
+
+static constexpr uint16_t DNS_PORT = 53;
+
+void WebServerManager::beginApPortal(WifiManager& wifi, AppState& state) {
+  wifi_ = &wifi;
+  state_ = &state;
+  apPortal_ = true;
+
+  dns_.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  resetServer_();
+  setupRoutesAp_();
+  server_->begin();
+}
+
+void WebServerManager::beginStaServer(WifiManager& wifi, AppState& state) {
+  wifi_ = &wifi;
+  state_ = &state;
+  apPortal_ = false;
+
+  dns_.stop();
+
+  resetServer_();
+  setupRoutesSta_();
+  server_->begin();
+}
+
+void WebServerManager::loop() {
+  if (apPortal_) dns_.processNextRequest();
+  if (server_) server_->handleClient();
+}
+
+// --- Captive portal helpers ---
+void WebServerManager::sendCaptiveRedirect_() {
+  String host = "http://" + WiFi.softAPIP().toString() + "/";
+
+  server_->sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server_->sendHeader("Pragma", "no-cache");
+  server_->sendHeader("Expires", "-1");
+  server_->sendHeader("Location", host, true);
+  server_->send(302, "text/plain", "");
+}
+
+void WebServerManager::addCaptivePortalRoutes_() {
+  // Android:
+  server_->on("/generate_204", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+  server_->on("/gen_204", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+
+  // iOS / macOS:
+  server_->on("/hotspot-detect.html", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+  server_->on("/library/test/success.html", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+
+  // Windows:
+  server_->on("/ncsi.txt", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+  server_->on("/connecttest.txt", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+  server_->on("/redirect", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+  server_->on("/fwlink", HTTP_ANY, [&]() { sendCaptiveRedirect_(); });
+}
+
+// --- AP setup routes (portal + scan) ---
+void WebServerManager::setupRoutesAp_() {
+  addCaptivePortalRoutes_();
+
+  server_->on("/style.css", HTTP_GET, [&]() {
+  File f = LittleFS.open("/style.css", "r");
+  if (!f) {
+    server_->send(404, "text/plain", "Not found");
+    return;
+  }
+  server_->streamFile(f, "text/css");
+  f.close();
+});
+
+
+  server_->on("/", HTTP_GET, [&]() {
+    server_->send(200, "text/html", htmlPortal_());
+  });
+
+  // Start scan (async)
+  server_->on("/api/scan/start", HTTP_POST, [&]() {
+    wifi_->startScanAsync();
+    server_->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  // Scan status + results
+  server_->on("/api/scan", HTTP_GET, [&]() {
+    StaticJsonDocument<256> meta;
+    meta["running"] = wifi_->isScanRunning();
+    meta["count"] = wifi_->scanCount();
+
+    String networks = wifi_->hasScanResults() ? wifi_->scanResultsJson() : "[]";
+
+    String out;
+    out.reserve(256 + networks.length());
+    serializeJson(meta, out);
+    out.remove(out.length() - 1);        // remove trailing }
+    out += ",\"networks\":";
+    out += networks;
+    out += "}";
+
+    server_->send(200, "application/json", out);
+  });
+
+  // Save creds
+  server_->on("/save", HTTP_POST, [&]() {
+    String ssid = server_->arg("ssid");
+    String pass = server_->arg("pass");
+
+    if (!ssid.length()) {
+      server_->send(400, "text/plain", "Missing SSID");
+      return;
+    }
+
+    wifi_->saveCredentialsAndConnect(ssid, pass);
+
+    server_->send(200, "text/html",
+      "<html><body><h3>Saved.</h3><p>Rebooting...</p></body></html>");
+    delay(300);
+    ESP.restart();
+  });
+
+  // Anything else: redirect to portal
+  server_->onNotFound([&]() {
+    sendCaptiveRedirect_();
+  });
+}
+
+// --- STA normal routes ---
+void WebServerManager::setupRoutesSta_() {
+  server_->on("/", HTTP_GET, [&]() {
+    server_->send(200, "text/html", htmlHome_());
+  });
+
+  server_->on("/api/status", HTTP_GET, [&]() {
+    StaticJsonDocument<384> doc;
+    doc["mode"] = "sta";
+    doc["connected"] = wifi_->isConnected();
+    doc["ip"] = wifi_->ipString();
+    doc["hostname"] = wifi_->hostname();
+    doc["ssid"] = wifi_->savedSsid();
+    doc["paramA"] = paramA_;
+
+    String out;
+    serializeJson(doc, out);
+    server_->send(200, "application/json", out);
+  });
+
+  server_->on("/api/settings", HTTP_GET, [&]() {
+    StaticJsonDocument<256> doc;
+    doc["paramA"] = paramA_;
+    String out;
+    serializeJson(doc, out);
+    server_->send(200, "application/json", out);
+  });
+
+  server_->on("/api/settings", HTTP_POST, [&]() {
+    if (!server_->hasArg("plain")) {
+      server_->send(400, "application/json", "{\"error\":\"missing body\"}");
+      return;
+    }
+
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, server_->arg("plain"));
+    if (err) {
+      server_->send(400, "application/json", "{\"error\":\"bad json\"}");
+      return;
+    }
+
+    if (doc.containsKey("paramA")) {
+      paramA_ = doc["paramA"].as<int>();
+    }
+
+    server_->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server_->on("/api/clear_wifi", HTTP_POST, [&]() {
+    state_->requestClearWifi = true;
+    server_->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server_->onNotFound([&]() {
+    server_->send(404, "text/plain", "Not found");
+  });
+}
+
+// --- Portal HTML with scan dropdown ---
+/*
+String WebServerManager::htmlPortal_() const {
+  return R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ESP32 Setup</title>
+  <style>
+    body{font-family:system-ui;margin:24px;max-width:560px}
+    input,select{width:100%;padding:10px;margin:8px 0}
+    button{padding:10px 14px;margin-right:8px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:16px}
+    .row{display:flex;gap:10px;align-items:center}
+    .row button{flex:0 0 auto}
+    small{color:#666}
+  </style>
+</head>
+<body>
+  <h2>Wi-Fi Setup</h2>
+
+  <div class="card">
+    <div class="row">
+      <button type="button" onclick="startScan()">Scan Networks</button>
+      <small id="scanStatus">Press scan to list nearby Wi-Fi</small>
+    </div>
+
+    <label>Networks</label>
+    <select id="ssidSelect" onchange="pickSsid()">
+      <option value="">-- scan to populate --</option>
+    </select>
+
+    <form method="POST" action="/save">
+      <label>SSID</label>
+      <input id="ssidInput" name="ssid" placeholder="Wi-Fi name" required />
+
+      <label>Password</label>
+      <input name="pass" placeholder="Wi-Fi password" type="password" />
+
+      <button type="submit">Save & Reboot</button>
+    </form>
+  </div>
+
+<script>
+  let scanTimer = null;
+
+  function pickSsid(){
+    const v = document.getElementById('ssidSelect').value;
+    if(v) document.getElementById('ssidInput').value = v;
+  }
+
+  async function startScan(){
+    document.getElementById('scanStatus').textContent = 'Starting scan...';
+    await fetch('/api/scan/start', {method:'POST'});
+    if(scanTimer) clearInterval(scanTimer);
+    scanTimer = setInterval(pollScan, 700);
+    pollScan();
+  }
+
+  async function pollScan(){
+    const r = await fetch('/api/scan');
+    const j = await r.json();
+    if(j.running){
+      document.getElementById('scanStatus').textContent = 'Scanning...';
+      return;
+    }
+    clearInterval(scanTimer);
+    scanTimer = null;
+
+    const sel = document.getElementById('ssidSelect');
+    sel.innerHTML = '';
+    const opt0 = document.createElement('option');
+    opt0.value = '';
+    opt0.textContent = '-- select network --';
+    sel.appendChild(opt0);
+
+    (j.networks || []).forEach(n => {
+      const o = document.createElement('option');
+      o.value = n.ssid;
+      const lock = n.open ? '' : ' 🔒';
+      o.textContent = `${n.ssid}${lock} (${n.rssi} dBm)`;
+      sel.appendChild(o);
+    });
+
+    document.getElementById('scanStatus').textContent =
+      `Scan done: ${(j.networks||[]).length} networks`;
+  }
+</script>
+</body>
+</html>
+)HTML";
+}
+*/
+
+String WebServerManager::htmlPortal_() const {
+  return R"HTML(
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>ESP32 Setup</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>ESP32 Wi-Fi Setup</h1>
+      <p>Connect this device to your home network</p>
+    </header>
+
+    <main class="card">
+      <div class="row">
+        <button class="btn btn-secondary" type="button" onclick="startScan()">Refresh</button>
+        <span id="scanStatus" class="status">Scanning…</span>
+      </div>
+
+      <label for="ssidSelect">Available networks</label>
+      <select id="ssidSelect" onchange="pickSsid()">
+        <option value="">Scanning…</option>
+      </select>
+
+      <form method="POST" action="/save">
+        <label for="ssidInput">Wi-Fi name (SSID)</label>
+        <input id="ssidInput" name="ssid" placeholder="Select or enter network" required />
+
+        <label for="passInput">Password</label>
+        <div class="pw">
+          <input id="passInput" name="pass" placeholder="Wi-Fi password" type="password" />
+          <button class="btn btn-ghost" type="button" onclick="togglePw()">Show</button>
+        </div>
+
+        <button class="btn btn-primary" type="submit">Save & Restart</button>
+      </form>
+    </main>
+
+    <footer class="footer">
+      After setup, open <b>http://esp32-xxxx.local</b> or check the OLED.
+    </footer>
+  </div>
+
+<script>
+  let scanTimer = null;
+
+  function pickSsid(){
+    const v = document.getElementById('ssidSelect').value;
+    if(v) document.getElementById('ssidInput').value = v;
+  }
+
+  function togglePw(){
+    const inp = document.getElementById('passInput');
+    const btn = inp.parentElement.querySelector('button');
+    const isPw = inp.type === 'password';
+    inp.type = isPw ? 'text' : 'password';
+    btn.textContent = isPw ? 'Hide' : 'Show';
+  }
+
+  async function startScan(){
+    document.getElementById('scanStatus').textContent = 'Scanning…';
+    await fetch('/api/scan/start', {method:'POST'});
+
+    if(scanTimer) clearInterval(scanTimer);
+    scanTimer = setInterval(pollScan, 700);
+    pollScan();
+  }
+
+  async function pollScan(){
+    const r = await fetch('/api/scan');
+    const j = await r.json();
+
+    if(j.running){
+      document.getElementById('scanStatus').textContent = 'Scanning…';
+      return;
+    }
+
+    clearInterval(scanTimer);
+    scanTimer = null;
+
+    const sel = document.getElementById('ssidSelect');
+    sel.innerHTML = '';
+
+    const opt0 = document.createElement('option');
+    opt0.value = '';
+    opt0.textContent = '-- select network --';
+    sel.appendChild(opt0);
+
+    (j.networks || []).forEach(n => {
+      const o = document.createElement('option');
+      o.value = n.ssid;
+      const lock = n.open ? '' : ' 🔒';
+      o.textContent = `${n.ssid}${lock} (${n.rssi} dBm)`;
+      sel.appendChild(o);
+    });
+
+    document.getElementById('scanStatus').textContent =
+      `Found ${(j.networks||[]).length} networks`;
+  }
+
+  // Auto-scan on load
+  startScan();
+</script>
+</body>
+</html>
+)HTML";
+}
+
+
+String WebServerManager::htmlHome_() const {
+  return R"HTML(
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>ESP32 Status</title>
+  <style>
+    body{font-family:system-ui;margin:24px;max-width:720px}
+    pre{background:#f6f6f6;padding:12px;border-radius:12px;overflow:auto}
+    button{padding:10px 14px;margin-right:8px}
+  </style>
+</head>
+<body>
+  <h2>ESP32 Status</h2>
+
+  <button onclick="refresh()">Refresh</button>
+  <button onclick="clearWifi()">Clear Wi-Fi (reboot)</button>
+
+  <h3>/api/status</h3>
+  <pre id="out">Loading...</pre>
+
+  <script>
+    async function refresh(){
+      const r = await fetch('/api/status');
+      document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+    }
+    async function clearWifi(){
+      if(!confirm('Clear Wi-Fi credentials and reboot?')) return;
+      await fetch('/api/clear_wifi', {method:'POST'});
+      alert('OK. Rebooting...');
+    }
+    refresh();
+  </script>
+</body>
+</html>
+)HTML";
+}

@@ -1,0 +1,313 @@
+//App.cpp
+
+#include "App.h"
+#include "Log.h"
+#include <time.h>
+#include <LittleFS.h>
+
+#include "iot/AwsIotProvisioner.h"
+#include "iot/IotConfig.h"
+#include "iot/Creds.h"
+
+static constexpr uint8_t  PIN_BOOT_BUTTON   = 0;     // BOOT is GPIO0 on most ESP32 dev boards
+static constexpr uint32_t UI_PERIOD_MS      = 250;
+static constexpr uint32_t BOOT_HOLD_CLEARMS = 2000;  // hold 2s to clear creds any time
+static constexpr uint32_t STA_TIMEOUT_MS    = 25000; // after 25s fail -> AP setup
+
+static bool ntpStarted = false;
+static uint32_t lastPublishMs = 0;
+const uint32_t PUBLISH_PERIOD_MS = 2000; // 2s
+
+// RS232 (via MAX3232) -> use UART2. Adjust to your wiring.
+static constexpr int PIN_RS232_RX = 16;  // ESP32 RX2  (connect to MAX3232 R1OUT)
+static constexpr int PIN_RS232_TX = 17;  // ESP32 TX2  (connect to MAX3232 T1IN)
+static constexpr uint32_t RS232_BAUD = 9600; // match T7E P3 setting
+
+void App::begin() {
+  Log::begin(115200);
+  Log::i("Booting...");
+
+  if (!LittleFS.begin(true)) {
+    Log::e("LittleFS mount failed");
+  }
+
+  resetBtn_.begin(PIN_BOOT_BUTTON, true /*pullup*/, true /*activeLow*/);
+
+  display_.begin();
+  display_.showBoot("Starting...");
+
+  // Start scale serial reader (non-blocking)
+  scale_.begin(Serial2, PIN_RS232_RX, PIN_RS232_TX, RS232_BAUD);
+  //scale_.setDebug(&Serial);          // prints "FRAME: =0.0000-"
+  scale_.setReverseDigits(true);    // your current frames look normal. if values come out reversed, change to true
+
+  wifi_.begin();
+
+  if (!wifi_.hasCredentials()) {
+    enterApSetup_();
+  } else {
+    enterStaNormal_();
+  }
+
+  lastUiMs_ = millis();
+  timeSynced_ = false;
+}
+
+void App::loop() {
+  resetBtn_.update();
+  wifi_.loop();
+  web_.loop();
+  scale_.loop();
+  iot_.loop();
+
+  // BOOT button:
+  // - short click (release): cycle WIFI -> QR -> SCALE
+  // - long press: clear Wi-Fi + reboot (anytime)
+  const bool pressed = resetBtn_.isPressed();
+  const uint32_t now = millis();
+  static bool longPressFired = false;
+/*
+  if (state_.mode == AppMode::STA_NORMAL &&
+          wifi_.isConnected() &&
+          !timeSynced_) {
+      syncTime_();
+      timeSynced_ = true;
+      time_t now = time(nullptr);
+      Log::i(String("Epoch now: ") + (uint32_t)now);
+  }
+  */  
+static bool ntpStarted = false;
+
+if (state_.mode == AppMode::STA_NORMAL && wifi_.isConnected() && !timeSynced_) {
+  if (!ntpStarted) {
+    syncTime_();          // calls configTzTime once
+    ntpStarted = true;
+  }
+
+  time_t now = time(nullptr);
+  if (now > 1700000000) {
+    timeSynced_ = true;
+    Log::i(String("Epoch now(valid): ") + (uint32_t)now);
+  } else {
+    static uint32_t lastLog = 0;
+    if (millis() - lastLog > 1000) {
+      lastLog = millis();
+      Log::w(String("Waiting for NTP... epoch=") + (uint32_t)now);
+    }
+  }
+}
+
+
+    bool iotStarted = false;
+    if (state_.mode == AppMode::STA_NORMAL && wifi_.isConnected() && timeSynced_ && !iotStarted) {
+    // 1) init store + see if device identity exists
+    iot_.begin(AWS_ROOT_CA_PEM, AWS_CLAIM_CERT_PEM, AWS_CLAIM_PRIVATE_KEY_PEM);
+
+    // 2) if already provisioned, connect using device cert
+    if (iot_.isProvisioned()) {
+      iot_.connectDeviceMqtt(AWS_IOT_ENDPOINT, AWS_IOT_PORT, deviceId().c_str());
+    } else {
+      // Later: call iot_.runProvisioning(...)
+      //Log::w("Device not provisioned yet (CSR provisioning step pending).");
+      Log::w("Provisioning...");
+      bool ok = iot_.runProvisioning(AWS_IOT_ENDPOINT, AWS_IOT_PORT, deviceId(), PROV_TEMPLATE);
+      Log::i(String("Provisioning result: ") + (ok ? "OK" : "FAIL: " + iot_.status()));
+      if (ok) {
+        iot_.connectDeviceMqtt(AWS_IOT_ENDPOINT, AWS_IOT_PORT, deviceId().c_str());
+      }
+    }
+
+    iotStarted = true;
+  }
+
+  if (iot_.isReady() && millis() - lastPublishMs >= PUBLISH_PERIOD_MS) {
+    lastPublishMs = millis();
+
+    StaticJsonDocument<256> doc;
+    doc["deviceId"] = deviceId();
+    doc["ts"] = (uint64_t)time(nullptr);
+    doc["weight"] = scale_.lastDisplayWeight();
+
+    String payload; serializeJson(doc, payload);
+    Log::i(String("MQTT publish: ") + payload); //console log
+
+    if (iot_.tenantId().length() == 0) {
+      iot_.publishJson(topicUnclaimedTelemetry(), doc);
+    } else {
+      iot_.publishJson(topicClaimedTelemetry(iot_.tenantId()), doc);
+    }
+  }
+
+
+
+
+
+
+  if (pressed && !prevPressed_) {
+    // just pressed
+    pressStartMs_ = now;
+    longPressFired = false;
+  }
+
+  if (pressed && pressStartMs_ != 0 && !longPressFired) {
+    if (now - pressStartMs_ >= BOOT_HOLD_CLEARMS) {
+      longPressFired = true;
+      Log::w("BOOT long-press: clearing Wi-Fi credentials...");
+      display_.showBoot("Clearing WiFi...");
+      wifi_.clearCredentials();
+      delay(100);
+      ESP.restart();
+    }
+  }
+
+  if (!pressed && prevPressed_) {
+    // just released
+    const uint32_t held = (pressStartMs_ == 0) ? 0 : (now - pressStartMs_);
+    pressStartMs_ = 0;
+
+    // short click only if it wasn't a long press and it was a real press
+    if (!longPressFired && held >= 30 && held < BOOT_HOLD_CLEARMS) {
+      Log::i("BOOT short click");
+
+      nextScreen_();
+
+      if (state_.screen == UiScreen::QR_CODE) {
+        const String url = "http://" + wifi_.ipString() + "/";
+        display_.showQrUrl(url);
+      }
+    }
+  }
+
+  prevPressed_ = pressed;
+
+  // Ensure mDNS in STA mode
+  if (state_.mode == AppMode::STA_NORMAL && wifi_.isConnected()) {
+    wifi_.ensureMdnsStarted();
+  }
+
+  // Web-requested clear Wi-Fi
+  if (state_.requestClearWifi) {
+    state_.requestClearWifi = false;
+    Log::w("Clearing Wi-Fi credentials (web requested)...");
+    display_.showBoot("Clearing WiFi...");
+    wifi_.clearCredentials();
+    delay(100);
+    ESP.restart();
+  }
+
+  // UI refresh (non-blocking)
+  if (millis() - lastUiMs_ >= UI_PERIOD_MS) {
+    lastUiMs_ = millis();
+    updateUi_();
+  }
+}
+
+void App::enterApSetup_() {
+  state_.mode = AppMode::AP_SETUP;
+  wifi_.startApSetup();
+  web_.beginApPortal(wifi_, state_);
+  Log::i("AP setup mode: SSID ESP32-SETUP, open 192.168.4.1");
+}
+
+void App::enterStaNormal_() {
+  state_.mode = AppMode::STA_NORMAL;
+  staStartMs_ = millis();
+  staFallbackDone_ = false;
+
+  wifi_.startSta();
+  web_.beginStaServer(wifi_, state_);
+  Log::i("STA normal mode: connecting...");
+}
+
+void App::handleSerial_() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      serialLine_.trim();
+      if (serialLine_.length()) {
+        if (serialLine_.equalsIgnoreCase("clearwifi")) {
+          Log::w("Serial command: clearwifi");
+          display_.showBoot("Clearing WiFi...");
+          wifi_.clearCredentials();
+          delay(100);
+          ESP.restart();
+        } else if (serialLine_.equalsIgnoreCase("ap")) {
+          Log::w("Serial command: ap");
+          enterApSetup_();
+        } else if (serialLine_.equalsIgnoreCase("sta")) {
+          Log::w("Serial command: sta");
+          if (wifi_.hasCredentials()) enterStaNormal_();
+          else Log::w("No saved creds. Use AP setup first.");
+        } else {
+          Log::i(String("Unknown command: ") + serialLine_);
+          Log::i("Commands: clearwifi | ap | sta");
+        }
+      }
+      serialLine_.clear();
+    } else {
+      if (serialLine_.length() < 80) serialLine_ += c;
+    }
+  }
+}
+
+void App::updateUi_() {
+
+  // If we're on QR screen, don't overwrite it with status updates.
+  // If Wi-Fi drops, fall back to info screen.
+  if (state_.screen == UiScreen::QR_CODE) {
+    if (!(state_.mode == AppMode::STA_NORMAL && wifi_.isConnected() && wifi_.ipString() != "0.0.0.0")) {
+      state_.screen = UiScreen::WIFI_INFO;
+    } else {
+      return;
+    }
+  }
+
+  state_.wifiConnected = wifi_.isConnected();
+  state_.ip = wifi_.ipString();
+  state_.hostname = wifi_.hostname();
+
+  if (state_.screen == UiScreen::SCALE && state_.scaleModeEnabled) {
+    display_.showScale(scale_.lastDisplayWeight(), scale_.lastTimestampString());//(scale_.lastPretty(), scale_.hasReading());
+  } else {
+    display_.showStatus(state_, wifi_);
+  }
+}
+
+void App::nextScreen_() {
+  // Always allow SCALE, but only allow QR when we have a valid STA IP.
+  const bool canQr = (state_.mode == AppMode::STA_NORMAL && wifi_.isConnected() && wifi_.ipString() != "0.0.0.0");
+  const bool canScale = state_.scaleModeEnabled;
+
+  UiScreen s = state_.screen;
+  for (int i = 0; i < 3; i++) {
+    // advance
+    s = (s == UiScreen::WIFI_INFO) ? UiScreen::QR_CODE :
+        (s == UiScreen::QR_CODE)   ? UiScreen::SCALE   : UiScreen::WIFI_INFO;
+
+    if (s == UiScreen::QR_CODE && !canQr) continue;
+    if (s == UiScreen::SCALE && !canScale) continue;
+    break;
+  }
+
+  state_.screen = s;
+}
+
+void App::syncTime_() {
+  // UTC offset + daylight offset (seconds)
+  // Example: CET (UTC+1), CEST handled via TZ below
+  // UTC	"UTC0"
+  // UK	"GMT0BST,M3.5.0/1,M10.5.0/2"
+  // Central Europe	"CET-1CEST,M3.5.0/2,M10.5.0/3"
+  // US Eastern	"EST5EDT,M3.2.0/2,M11.1.0/2"
+  // Cairo ignoring daylight saving "UTC-2"
+  // Cairo considering daylight saving: "EET-2EEST,M4.5.5/0,M10.5.4/24"
+
+  configTzTime(
+    "UTC0",  // UTC time
+    "pool.ntp.org",
+    "time.nist.gov"
+  );
+
+  Log::i("NTP time sync requested");
+}
