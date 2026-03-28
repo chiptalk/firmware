@@ -1,0 +1,135 @@
+:root{
+  --bg:#f5f7fb;
+  --card:#ffffff;
+  --text:#0f172a;
+  --muted:#64748b;
+  --border:#e2e8f0;
+  --shadow:0 14px 30px rgba(2,6,23,.08);
+  --primary:#2563eb;
+  --primary2:#1d4ed8;
+  --radius:16px;
+}
+
+*{box-sizing:border-box}
+html,body{height:100%}
+
+body{
+  margin:0;
+  font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;
+  color:var(--text);
+  background:radial-gradient(900px 420px at 30% 0%, #e8efff, transparent 60%),
+             radial-gradient(900px 420px at 70% 0%, #f0f7ff, transparent 60%),
+             var(--bg);
+}
+
+.container{
+  max-width:420px;
+  margin:0 auto;
+  padding:18px 14px 22px;
+}
+
+.header{
+  text-align:center;
+  margin:10px 0 14px;
+}
+.header h1{
+  margin:0;
+  font-size:1.35rem;
+  letter-spacing:-0.02em;
+}
+.header p{
+  margin:6px 0 0;
+  color:var(--muted);
+  font-size:.95rem;
+}
+
+.card{
+  background:var(--card);
+  border:1px solid rgba(226,232,240,.9);
+  border-radius:var(--radius);
+  box-shadow:var(--shadow);
+  padding:16px;
+}
+
+label{
+  display:block;
+  margin:14px 0 6px;
+  font-size:.85rem;
+  color:var(--muted);
+}
+
+input,select{
+  width:100%;
+  padding:12px 12px;
+  border:1px solid var(--border);
+  border-radius:12px;
+  font-size:1rem;
+  outline:none;
+  background:#fff;
+}
+
+input:focus,select:focus{
+  border-color:rgba(37,99,235,.55);
+  box-shadow:0 0 0 4px rgba(37,99,235,.12);
+}
+
+.row{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:10px;
+}
+
+.status{
+  color:var(--muted);
+  font-size:.88rem;
+}
+
+.pw{
+  display:flex;
+  gap:10px;
+  align-items:center;
+}
+.pw input{flex:1}
+
+.btn{
+  border:0;
+  border-radius:14px;
+  padding:12px 14px;
+  font-size:.95rem;
+  cursor:pointer;
+  user-select:none;
+}
+
+.btn-primary{
+  width:100%;
+  margin-top:16px;
+  font-weight:650;
+  color:#fff;
+  background:linear-gradient(180deg,var(--primary),var(--primary2));
+  box-shadow:0 10px 20px rgba(37,99,235,.22);
+}
+.btn-primary:active{transform:translateY(1px)}
+
+.btn-secondary{
+  background:#eef2ff;
+  color:#1d4ed8;
+  font-weight:600;
+  padding:10px 12px;
+}
+
+.btn-ghost{
+  background:#f1f5f9;
+  color:#0f172a;
+  padding:10px 12px;
+  border:1px solid var(--border);
+  white-space:nowrap;
+}
+
+.footer{
+  text-align:center;
+  margin-top:12px;
+  color:var(--muted);
+  font-size:.82rem;
+}

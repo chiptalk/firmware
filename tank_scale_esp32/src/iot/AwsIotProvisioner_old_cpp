@@ -1,0 +1,216 @@
+// src/iot/AwsIotProvisioner.cpp
+
+#include "AwsIotProvisioner.h"
+#include "iot/IotConfig.h"
+#include <ArduinoJson.h>
+#include "app/Log.h"
+
+// Must be big enough to hold create/json accepted payload (cert + privateKey)
+static constexpr size_t MQTT_BUF_SIZE = 8192;
+
+// ---------- lifecycle ----------
+
+void AwsIotProvisioner::begin(const char* rootCaPem,
+                             const char* claimCertPem,
+                             const char* claimKeyPem) {
+  rootCa_ = rootCaPem;
+  claimCert_ = claimCertPem;
+  claimKey_ = claimKeyPem;
+
+  provisioned_ = store_.load(ident_);
+  status_ = provisioned_ ? "device_identity_loaded" : "needs_provisioning";
+}
+
+bool AwsIotProvisioner::connectDeviceMqtt(const char* endpoint, int port, const char* clientId) {
+  if (!store_.load(ident_)) {
+    status_ = "no_device_identity";
+    return false;
+  }
+
+  net_.setCACert(rootCa_);
+  net_.setCertificate(ident_.deviceCertPem.c_str());
+  net_.setPrivateKey(ident_.devicePrivKeyPem.c_str());
+  net_.setHandshakeTimeout(30);
+
+  mqtt_.setServer(endpoint, port);
+  mqtt_.setBufferSize(MQTT_BUF_SIZE);
+
+  mqttReady_ = mqtt_.connect(clientId);
+  status_ = mqttReady_ ? "mqtt_connected_device" : "mqtt_connect_failed_device";
+  return mqttReady_;
+}
+
+void AwsIotProvisioner::mqttLoop_() {
+  if (mqttReady_) mqtt_.loop();
+}
+
+bool AwsIotProvisioner::publishJson(const String& topic, const JsonDocument& doc) {
+  if (!mqttReady_) return false;
+  String payload;
+  serializeJson(doc, payload);
+  return mqtt_.publish(topic.c_str(), payload.c_str());
+}
+
+void AwsIotProvisioner::loop() {
+  mqttLoop_();
+}
+
+// ---------- provisioning helpers ----------
+
+static String g_lastTopic;
+static String g_lastPayload;
+
+static void mqttCb(char* topic, byte* payload, unsigned int len) {
+  g_lastTopic = String(topic);
+  g_lastPayload = "";
+  g_lastPayload.reserve(len + 1);
+  for (unsigned int i = 0; i < len; i++) g_lastPayload += (char)payload[i];
+}
+
+static bool waitForAnyTopicWithPrefix(PubSubClient& mqtt, const String& prefix, uint32_t timeoutMs) {
+  const uint32_t start = millis();
+  while (millis() - start < timeoutMs) {
+    mqtt.loop();
+    delay(5);
+    if (g_lastTopic.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+// ---------- provisioning (Option A: create/json) ----------
+
+bool AwsIotProvisioner::runProvisioning(const char* endpoint, int port,
+                                        const String& deviceId,
+                                        const char* templateName) {
+  String privKeyPem;
+  String certificatePem;
+  String ownershipToken;
+
+  // Connect with CLAIM cert
+  net_.setCACert(rootCa_);
+  net_.setCertificate(claimCert_);
+  net_.setPrivateKey(claimKey_);
+  net_.setHandshakeTimeout(30);
+
+  mqtt_.setServer(endpoint, port);
+  mqtt_.setCallback(mqttCb);
+  mqtt_.setBufferSize(MQTT_BUF_SIZE);
+
+  String claimClientId = "claim-" + deviceId;
+
+  Log::i("AWS IoT connect (CLAIM)");
+  Log::i(String(" endpoint=") + endpoint);
+  Log::i(String(" port=") + port);
+  Log::i(String(" clientId=") + claimClientId);
+  Log::i(String(" rootCA len=") + strlen(rootCa_));
+  Log::i(String(" claimCert len=") + strlen(claimCert_));
+  Log::i(String(" claimKey len=") + strlen(claimKey_));
+  Log::i(String(" mqtt buf=") + (int)MQTT_BUF_SIZE);
+
+  if (!mqtt_.connect(claimClientId.c_str())) {
+    status_ = "mqtt_connect_failed_claim";
+    return false;
+  }
+
+  // Subscribe with request-id wildcard
+  const String createAcceptedPrefix = "$aws/certificates/create/json/accepted/";
+  const String createRejectedPrefix = "$aws/certificates/create/json/rejected/";
+  const String provAcceptedPrefix =
+      String("$aws/provisioning-templates/") + templateName + "/provision/json/accepted/";
+  const String provRejectedPrefix =
+      String("$aws/provisioning-templates/") + templateName + "/provision/json/rejected/";
+
+  mqtt_.subscribe("$aws/certificates/create/json/accepted/+");
+  mqtt_.subscribe("$aws/certificates/create/json/rejected/+");
+  mqtt_.subscribe((String("$aws/provisioning-templates/") + templateName + "/provision/json/accepted/+").c_str());
+  mqtt_.subscribe((String("$aws/provisioning-templates/") + templateName + "/provision/json/rejected/+").c_str());
+
+  // 1) Create keys + cert (no CSR)
+  g_lastTopic = ""; g_lastPayload = "";
+  if (!mqtt_.publish("$aws/certificates/create/json", "{}")) {
+    status_ = "publish_create_cert_failed";
+    return false;
+  }
+
+  // Wait for either accepted or rejected
+  if (!waitForAnyTopicWithPrefix(mqtt_, "$aws/certificates/create/json/", 15000)) {
+    status_ = "create_cert_timeout";
+    return false;
+  }
+  if (g_lastTopic.startsWith(createRejectedPrefix)) {
+    status_ = "create_cert_rejected:" + g_lastPayload;
+    return false;
+  }
+  if (!g_lastTopic.startsWith(createAcceptedPrefix)) {
+    status_ = "create_cert_timeout";
+    return false;
+  }
+
+  // Parse create cert response
+  {
+    DynamicJsonDocument resp(8192);
+    auto err = deserializeJson(resp, g_lastPayload);
+    if (err) { status_ = "create_cert_resp_parse_failed"; return false; }
+
+    ownershipToken = resp["certificateOwnershipToken"].as<String>();
+    certificatePem = resp["certificatePem"].as<String>();
+    privKeyPem     = resp["privateKey"].as<String>();
+
+    if (!ownershipToken.length() || !certificatePem.length() || !privKeyPem.length()) {
+      status_ = "create_cert_resp_missing_fields";
+      return false;
+    }
+  }
+
+  // 2) Provision using template
+  {
+    DynamicJsonDocument doc2(1024);
+    doc2["certificateOwnershipToken"] = ownershipToken;
+    JsonObject params = doc2.createNestedObject("parameters");
+    params["DeviceId"] = deviceId;
+
+    String payload;
+    serializeJson(doc2, payload);
+
+    g_lastTopic = ""; g_lastPayload = "";
+    const String provTopic = String("$aws/provisioning-templates/") + templateName + "/provision/json";
+    if (!mqtt_.publish(provTopic.c_str(), payload.c_str())) {
+      status_ = "publish_prov_failed";
+      return false;
+    }
+
+    if (!waitForAnyTopicWithPrefix(mqtt_,
+          String("$aws/provisioning-templates/") + templateName + "/provision/json/",
+          15000)) {
+      status_ = "prov_timeout";
+      return false;
+    }
+
+    if (g_lastTopic.startsWith(provRejectedPrefix)) {
+      status_ = "prov_rejected:" + g_lastPayload;
+      return false;
+    }
+    if (!g_lastTopic.startsWith(provAcceptedPrefix)) {
+      status_ = "prov_timeout";
+      return false;
+    }
+  }
+
+  // Save device identity locally
+  IotIdentity id;
+  id.deviceCertPem = certificatePem;
+  id.devicePrivKeyPem = privKeyPem;
+  if (!store_.save(id)) {
+    status_ = "save_identity_failed";
+    return false;
+  }
+
+  status_ = "provisioned_saved";
+  provisioned_ = true;
+
+  mqtt_.disconnect();
+  mqttReady_ = false;
+  return true;
+}
+
+
